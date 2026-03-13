@@ -68,49 +68,45 @@ def build_caption_html(card: WineCard, offers: list[dict]) -> str:
     return "\n".join(lines)
 
 async def make_card(client: AsyncOpenAI, model: str, raw_candidates: list[dict]) -> WineCard:
-    # raw_candidates: list of dict with store/url/title/price/image/raw_text
-    # We ask the model to:
-    # - unify the wine identity
-    # - extract characteristics (best effort)
-    # - generate 4-6 sentence description
-    prompt = {
-        "role": "user",
-        "content": [
-            {"type": "input_text", "text": (
-                "You are a wine-card generator for a Telegram channel in Russia.
-"
-                "Given raw store product data (names may differ), identify the SAME wine if possible, "
-                "normalize the canonical name in Russian/Latin as appropriate, extract characteristics if present, "
-                "and write a 4-6 sentence description in Russian. Keep it friendly, not cheesy, a bit witty is ok.
+    """Use the model to normalize wine identity + characteristics and generate description.
 
-"
-                "Return ONLY a single JSON object matching this schema:
-"
-                "{"
-                ""canonical_name": string, "
-                ""type": string|null, "
-                ""color": string|null, "
-                ""sugar": string|null, "
-                ""country": string|null, "
-                ""region": string|null, "
-                ""grape": string|null, "
-                ""volume_ml": integer|null, "
-                ""abv": number|null, "
-                ""description": string"
-                "}
+    raw_candidates: list of dicts with keys like:
+      store, url, title, price_rub, image_url, raw_text
+    """
+    prompt_text = (
+        "You are a wine-card generator for a Telegram channel in Russia.\n"
+        "You receive raw product data from Russian wine stores (names/fields may differ).\n"
+        "Task:\n"
+        "1) Decide whether the candidates refer to the same wine. If they do, unify into ONE canonical wine.\n"
+        "2) Produce a canonical_name (use the most recognizable name; keep brand/producer if present).\n"
+        "3) Extract characteristics if present in the data (best-effort; do NOT invent).\n"
+        "4) Write a 4–6 sentence description in Russian: friendly, useful, slightly witty, not cheesy.\n\n"
+        "Return ONLY a single JSON object with this schema (no extra text):\n"
+        "{\n"
+        "  \"canonical_name\": string,\n"
+        "  \"type\": string|null,\n"
+        "  \"color\": string|null,\n"
+        "  \"sugar\": string|null,\n"
+        "  \"country\": string|null,\n"
+        "  \"region\": string|null,\n"
+        "  \"grape\": string|null,\n"
+        "  \"volume_ml\": integer|null,\n"
+        "  \"abv\": number|null,\n"
+        "  \"description\": string\n"
+        "}\n\n"
+        "Raw candidates JSON:\n"
+    )
 
-"
-                "Raw candidates:
-"
-            )},
-            {"type": "input_text", "text": json.dumps(raw_candidates, ensure_ascii=False)[:12000]},
-        ],
-    }
-
+    payload = json.dumps(raw_candidates, ensure_ascii=False)
     resp = await client.responses.create(
         model=model,
-        input=[prompt],
-        # reduce storage if desired:
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": prompt_text},
+                {"type": "input_text", "text": payload[:12000]},
+            ],
+        }],
         store=False,
     )
     data = _extract_json(resp.output_text)
