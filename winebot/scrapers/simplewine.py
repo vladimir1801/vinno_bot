@@ -1,67 +1,150 @@
+from __future__ import annotations
+
+import json
 import re
+from typing import Any, Iterable
+
 import httpx
 from selectolax.parser import HTMLParser
+
 from .base import RawOffer
 
-UA = {"User-Agent": "Mozilla/5.0 (WineBot/1.0)"}
 
-def _int_price_from_text(text: str) -> int | None:
-    # examples: "1 299 ₽"
-    m = re.search(r"(\d[\d\s]{2,})\s*₽", text)
-    if not m:
+UA = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+}
+
+
+def _clean_text(text: str, limit: int = 2000) -> str:
+    return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
+def _extract_json_ld(html_text: str) -> Iterable[dict[str, Any] | list[Any]]:
+    doc = HTMLParser(html_text)
+    for node in doc.css('script[type="application/ld+json"]'):
+        raw = (node.text() or "").strip()
+        if not raw:
+            continue
+        try:
+            yield json.loads(raw)
+        except Exception:
+            continue
+
+
+def _int_price_from_any(value: Any) -> int | None:
+    if value is None:
+        return None
+    raw = str(value).replace("\xa0", " ").replace(" ", "").replace(",", ".")
+    match = re.search(r"\d+(?:\.\d+)?", raw)
+    if not match:
         return None
     try:
-        return int(m.group(1).replace(" ", ""))
-    except Exception:
+        return int(float(match.group(0)))
+    except ValueError:
         return None
 
-def _clean_text(s: str, limit: int = 2000) -> str:
-    s = re.sub(r"\s+", " ", s).strip()
-    return s[:limit]
 
 class SimpleWineScraper:
     store = "SimpleWine"
 
-    def __init__(self):
-        self.client = httpx.AsyncClient(timeout=25, follow_redirects=True, headers=UA)
+    def __init__(self) -> None:
+        self.client = httpx.AsyncClient(
+            timeout=25,
+            follow_redirects=True,
+            headers=UA,
+        )
 
     async def get_candidate_urls(self) -> list[str]:
         url = "https://simplewine.ru/catalog/vino/"
-        r = await self.client.get(url)
-        if r.status_code >= 400:
+        try:
+            response = await self.client.get(url)
+            response.raise_for_status()
+        except Exception:
             return []
-        doc = HTMLParser(r.text)
-        urls = []
-        for a in doc.css("a"):
-            href = a.attributes.get("href")
-            if not href:
+
+        doc = HTMLParser(response.text)
+        urls: list[str] = []
+
+        for node in doc.css("a[href]"):
+            href = node.attributes.get("href", "")
+            if "/catalog/" not in href or "vino" not in href:
                 continue
-            if "/catalog/" in href and "vino" in href and href.count("/") >= 4:
-                if href.startswith("/"):
-                    href = "https://simplewine.ru" + href
-                urls.append(href.split("?")[0])
-        seen, out = set(), []
-        for u in urls:
-            if u not in seen:
-                seen.add(u)
-                out.append(u)
-        return out[:120]
+            if href.startswith("/"):
+                href = "https://simplewine.ru" + href
+            urls.append(href.split("?")[0])
+
+        seen: set[str] = set()
+        unique_urls: list[str] = []
+        for item in urls:
+            if item in seen:
+                continue
+            seen.add(item)
+            unique_urls.append(item)
+
+        return unique_urls[:120]
 
     async def parse_offer(self, url: str) -> RawOffer | None:
-        r = await self.client.get(url)
-        if r.status_code >= 400:
+        try:
+            response = await self.client.get(url)
+            response.raise_for_status()
+        except Exception:
             return None
-        doc = HTMLParser(r.text)
 
-        h1 = doc.css_first("h1")
-        title = h1.text().strip() if h1 else None
+        doc = HTMLParser(response.text)
+        title: str | None = None
+        price: int | None = None
+        image: str | None = None
 
-        og = doc.css_first('meta[property="og:image"]')
-        image = og.attributes.get("content") if og else None
+        for block in _extract_json_ld(response.text):
+            items: list[Any]
+            if isinstance(block, dict) and isinstance(block.get("@graph"), list):
+                items = block["@graph"]
+            elif isinstance(block, list):
+                items = block
+            elif isinstance(block, dict):
+                items = [block]
+            else:
+                items = []
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("@type") != "Product":
+                    continue
+
+                title = item.get("name") or title
+
+                image_value = item.get("image")
+                if isinstance(image_value, list) and image_value:
+                    image = image_value[0] or image
+                elif isinstance(image_value, str):
+                    image = image_value
+
+                offers = item.get("offers")
+                if isinstance(offers, dict):
+                    price = _int_price_from_any(offers.get("price")) or price
+
+        if not title:
+            h1 = doc.css_first("h1")
+            if h1:
+                title = h1.text().strip()
+
+        if not image:
+            og = doc.css_first('meta[property="og:image"]')
+            if og:
+                image = og.attributes.get("content")
+
+        if price is None:
+            text = doc.text()
+            match = re.search(r"(\d[\d\s]{2,})\s*₽", text)
+            if match:
+                price = _int_price_from_any(match.group(1))
 
         raw_text = _clean_text(doc.text())
-        price = _int_price_from_text(raw_text)
-
         return RawOffer(
             store=self.store,
             url=url,
