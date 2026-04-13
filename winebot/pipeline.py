@@ -28,8 +28,25 @@ def _looks_similar(title_a: str, title_b: str) -> bool:
     b = _title_tokens(title_b)
     if not a or not b:
         return False
+
     overlap = len(a & b)
-    return overlap >= max(2, min(len(a), len(b)) // 2)
+    threshold = max(2, min(len(a), len(b)) // 2)
+    return overlap >= threshold
+
+
+async def _collect_source_urls(scraper: Any, max_candidates: int) -> list[str]:
+    urls = await scraper.get_candidate_urls()
+    if not urls:
+        print(f"[source:{scraper.store}] 0 candidate urls")
+        return []
+
+    random.shuffle(urls)
+    limited = urls[: max(max_candidates, 20)]
+    print(
+        f"[source:{scraper.store}] collected {len(urls)} urls, "
+        f"using {len(limited)} for this run"
+    )
+    return limited
 
 
 async def find_and_prepare_draft(
@@ -41,21 +58,52 @@ async def find_and_prepare_draft(
     max_candidates: int,
     debug: bool = False,
 ) -> dict[str, Any] | None:
-    scrapers = [LentaScraper(), SimpleWineScraper()]
-    candidate_pairs: list[tuple[Any, str]] = []
+    scrapers = [SimpleWineScraper(), LentaScraper()]
+
+    source_urls: dict[str, list[str]] = {}
+    active_scrapers: list[Any] = []
 
     for scraper in scrapers:
-        urls = await scraper.get_candidate_urls()
-        random.shuffle(urls)
-        candidate_pairs.extend((scraper, url) for url in urls[:max_candidates])
+        urls = await _collect_source_urls(scraper, max_candidates)
+        source_urls[scraper.store] = urls
+        if urls:
+            active_scrapers.append(scraper)
+
+    if not active_scrapers:
+        print("[pipeline] no active sources returned any candidate urls")
+        return None
+
+    candidate_pairs: list[tuple[Any, str]] = []
+    for scraper in active_scrapers:
+        candidate_pairs.extend((scraper, url) for url in source_urls[scraper.store][:max_candidates])
 
     random.shuffle(candidate_pairs)
+    print(f"[pipeline] total candidate pairs for parsing: {len(candidate_pairs)}")
 
+    parse_failures = 0
+    llm_failures = 0
+    recent_skips = 0
+    empty_image_skips = 0
     attempts = 0
-    for scraper, url in candidate_pairs[:max_candidates]:
+
+    for scraper, url in candidate_pairs:
         attempts += 1
+        print(f"[pipeline] attempt {attempts}/{len(candidate_pairs)} -> {scraper.store}: {url}")
+
         offer = await scraper.parse_offer(url)
-        if not offer or not offer.title or not offer.image_url:
+        if not offer:
+            parse_failures += 1
+            print(f"[pipeline] parse failed: {scraper.store} {url}")
+            continue
+
+        if not offer.title:
+            parse_failures += 1
+            print(f"[pipeline] parsed without title: {scraper.store} {url}")
+            continue
+
+        if not offer.image_url:
+            empty_image_skips += 1
+            print(f"[pipeline] skip without image: {offer.title} ({scraper.store})")
             continue
 
         raw_bundle: list[dict[str, Any]] = [
@@ -69,14 +117,15 @@ async def find_and_prepare_draft(
             }
         ]
 
-        for other_scraper in scrapers:
+        for other_scraper in active_scrapers:
             if other_scraper.store == offer.store:
                 continue
 
-            other_urls = await other_scraper.get_candidate_urls()
-            random.shuffle(other_urls)
+            other_urls = source_urls.get(other_scraper.store, [])[:30]
+            if not other_urls:
+                continue
 
-            for other_url in other_urls[:30]:
+            for other_url in other_urls:
                 other_offer = await other_scraper.parse_offer(other_url)
                 if not other_offer or not other_offer.title:
                     continue
@@ -93,15 +142,26 @@ async def find_and_prepare_draft(
                         "raw_text": other_offer.raw_text,
                     }
                 )
+                print(
+                    f"[pipeline] matched cross-store: '{offer.title}' <-> '{other_offer.title}'"
+                )
                 break
 
-        card = await make_card(client, model, raw_bundle)
-        fingerprint = fingerprint_from(card.canonical_name, card.volume_ml)
+        try:
+            card = await make_card(client, model, raw_bundle)
+        except Exception as exc:
+            llm_failures += 1
+            print(f"[pipeline] LLM failed for {offer.title!r}: {exc}")
+            continue
 
+        fingerprint = fingerprint_from(card.canonical_name, card.volume_ml)
         last_posted_at = await db.get_last_posted_at(fingerprint)
         if last_posted_at and _days_since(last_posted_at) < days_cooldown:
-            if debug:
-                print(f"[skip] {card.canonical_name} - posted recently: {last_posted_at}")
+            recent_skips += 1
+            print(
+                f"[pipeline] skip recent duplicate: {card.canonical_name} "
+                f"(last posted {last_posted_at})"
+            )
             continue
 
         offers = [
@@ -118,8 +178,10 @@ async def find_and_prepare_draft(
         )
         caption_html = build_caption_html(card, offers)
 
-        if debug:
-            print(f"[picked] {card.canonical_name}; attempts={attempts}")
+        print(
+            f"[pipeline] picked candidate: {card.canonical_name}; "
+            f"offers={len(offers)}; attempts={attempts}"
+        )
 
         return {
             "fingerprint": fingerprint,
@@ -129,4 +191,10 @@ async def find_and_prepare_draft(
             "offers": offers,
         }
 
+    print(
+        "[pipeline] no draft found. "
+        f"attempts={attempts}, parse_failures={parse_failures}, "
+        f"llm_failures={llm_failures}, recent_skips={recent_skips}, "
+        f"empty_image_skips={empty_image_skips}"
+    )
     return None
