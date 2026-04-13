@@ -4,12 +4,6 @@ import os
 from dataclasses import dataclass
 
 
-def _as_bool(value: str | None, default: bool = False) -> bool:
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
 @dataclass(slots=True)
 class Settings:
     bot_token: str
@@ -44,12 +38,16 @@ def load_settings() -> Settings:
     except ValueError:
         max_candidates = 8
 
+    database_path = os.getenv("DATABASE_PATH", "winebot.db").strip() or "winebot.db"
+    tz = os.getenv("TZ", "Asia/Yekaterinburg").strip() or "Asia/Yekaterinburg"
+    debug = os.getenv("DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
     return Settings(
         bot_token=bot_token,
         admin_id=admin_id,
         channel_id=channel_id,
-        debug=_as_bool(os.getenv("DEBUG"), False),
+        debug=debug,
         max_candidates=max_candidates,
-        database_path=os.getenv("DATABASE_PATH", "winebot.db").strip() or "winebot.db",
-        tz=os.getenv("TZ", "Asia/Yekaterinburg").strip() or "Asia/Yekaterinburg",
+        database_path=database_path,
+        tz=tz,
     )
