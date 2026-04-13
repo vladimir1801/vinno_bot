@@ -114,32 +114,27 @@ class SimpleWineBrowser:
         return []
 
     @staticmethod
-    @staticmethod
-def _looks_like_product_url(url: str) -> bool:
-    if not url.startswith("https://simplewine.ru/catalog/vino/"):
-        return False
-
-    # убираем мусор
-    bad_parts = [
-        "?page-number=",
-        "/filter/",
-        "/sorting/",
-        "#",
-    ]
-
-    for part in bad_parts:
-        if part in url:
+    def _looks_like_product_url(url: str) -> bool:
+        if not url.startswith("https://simplewine.ru/catalog/vino/"):
             return False
 
-    # убираем категории (porto, kheres и т.п.)
-    parts = url.replace("https://simplewine.ru/catalog/vino/", "").strip("/").split("/")
+        bad_parts = [
+            "?page-number=",
+            "/filter/",
+            "/sorting/",
+            "#",
+        ]
+        for part in bad_parts:
+            if part in url:
+                return False
 
-    # товар = обычно 2+ сегмента и нет пустоты
-    if len(parts) < 2:
-        return False
+        tail = url.replace("https://simplewine.ru/catalog/vino/", "").strip("/")
+        parts = [p for p in tail.split("/") if p]
 
-    # если короткое слово типа "porto" — это категория
-    if len(parts) == 1 and len(parts[0]) < 12:
-        return False
+        if len(parts) < 2:
+            return False
 
-    return True
+        if len(parts) == 1 and len(parts[0]) < 12:
+            return False
+
+        return True
