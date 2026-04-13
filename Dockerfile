@@ -1,10 +1,11 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
+# Системные зависимости для Playwright/Chromium
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     ca-certificates \
@@ -27,11 +28,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender1 \
     libfontconfig1 \
     libfreetype6 \
+    fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
+# Python-зависимости
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN playwright install chromium
+
+# Устанавливаем Chromium с зависимостями через Playwright
+RUN playwright install chromium --with-deps
 
 COPY . .
 
