@@ -6,194 +6,139 @@ import logging
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from openai import AsyncOpenAI
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
+from aiogram.client.default import DefaultBotProperties
 
-from winebot.config import load_config
-from winebot.db import DB
+from winebot.config import load_settings
+from winebot.db import delete_draft, init_db, load_draft, mark_posted, save_draft
 from winebot.pipeline import find_and_prepare_draft
-from winebot.scheduler import setup_scheduler
 
 
 logging.basicConfig(level=logging.INFO)
 
-cfg = load_config()
-db = DB(cfg.sqlite_path)
-client = AsyncOpenAI(api_key=cfg.openai_api_key)
+settings = load_settings()
+bot = Bot(
+    token=settings.bot_token,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 dp = Dispatcher()
 
 
-def kb_preview() -> InlineKeyboardMarkup:
+def _preview_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Утвердить", callback_data="approve"),
-                InlineKeyboardButton(text="🔁 Новая генерация", callback_data="regen"),
-                InlineKeyboardButton(text="✍️ Изменить", callback_data="edit"),
+                InlineKeyboardButton(text="Опубликовать", callback_data="publish"),
+                InlineKeyboardButton(text="Другое вино", callback_data="next"),
             ]
         ]
     )
 
 
-class EditStates(StatesGroup):
-    waiting_text = State()
+async def _send_preview(chat_id: int, payload: dict) -> None:
+    await save_draft(settings.database_path, chat_id, payload)
+    caption = payload["caption"]
 
+    if payload.get("image_url"):
+        try:
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=payload["image_url"],
+                caption=caption,
+                reply_markup=_preview_keyboard(),
+            )
+            return
+        except Exception as exc:
+            logging.warning("Preview photo send failed: %s", exc)
 
-async def generate_preview(bot: Bot, chat_id: int) -> None:
-    prepared = await find_and_prepare_draft(
-        db,
-        client,
-        cfg.openai_model,
-        days_cooldown=cfg.days_cooldown,
-        max_candidates=cfg.max_candidates,
-        debug=cfg.debug,
+    await bot.send_message(
+        chat_id=chat_id,
+        text=caption,
+        reply_markup=_preview_keyboard(),
+        disable_web_page_preview=False,
     )
 
-    if not prepared:
+
+async def generate_preview(chat_id: int) -> None:
+    payload = await find_and_prepare_draft(settings)
+    if not payload:
         await bot.send_message(
             chat_id,
-            "Не нашла подходящего кандидата. Возможно, магазины не отдали данные или всё недавно уже публиковалось. Попробуй ещё раз: /post",
+            "Не нашла подходящего кандидата. Попробуй ещё раз через пару минут.",
         )
         return
 
-    msg = await bot.send_photo(
-        chat_id=chat_id,
-        photo=prepared["image_url"],
-        caption=prepared["caption_html"],
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb_preview(),
-    )
-
-    draft_id = await db.create_draft(
-        fingerprint=prepared["fingerprint"],
-        canonical_name=prepared["canonical_name"],
-        image_url=prepared["image_url"],
-        caption_html=prepared["caption_html"],
-        preview_chat_id=chat_id,
-        preview_message_id=msg.message_id,
-    )
-
-    for offer in prepared["offers"]:
-        await db.add_offer(
-            draft_id=draft_id,
-            store=offer["store"],
-            price_rub=offer.get("price_rub"),
-            url=offer["url"],
-        )
+    await _send_preview(chat_id, payload)
 
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message) -> None:
-    if message.from_user and message.from_user.id == cfg.admin_user_id:
-        await message.answer("Бот запущен. Для превью используй /post")
+    if message.from_user and message.from_user.id != settings.admin_id:
+        await message.answer("Этот бот работает только для администратора.")
+        return
+    await message.answer("Бот запущен. Для превью используй /post")
 
 
 @dp.message(Command("post"))
 async def cmd_post(message: Message) -> None:
-    if not message.from_user or message.from_user.id != cfg.admin_user_id:
+    if message.from_user and message.from_user.id != settings.admin_id:
+        await message.answer("Эта команда доступна только администратору.")
         return
-    await generate_preview(message.bot, message.chat.id)
+    await generate_preview(message.chat.id)
 
 
-@dp.callback_query(F.data.in_({"approve", "regen", "edit"}))
-async def on_action(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.from_user or callback.from_user.id != cfg.admin_user_id:
-        await callback.answer("Эти кнопки не для тебя.", show_alert=True)
+@dp.callback_query(F.data == "next")
+async def cb_next(callback: CallbackQuery) -> None:
+    if callback.from_user.id != settings.admin_id:
+        await callback.answer("Недоступно", show_alert=True)
         return
+    await callback.answer("Ищу другой вариант...")
+    await generate_preview(callback.message.chat.id)
 
-    if not callback.message:
-        await callback.answer("Сообщение не найдено.", show_alert=True)
-        return
 
-    draft = await db.get_draft_by_preview(callback.message.chat.id, callback.message.message_id)
-    if not draft:
-        await callback.answer("Черновик не найден.", show_alert=True)
-        return
-
-    if callback.data == "approve":
-        sent = await callback.bot.send_photo(
-            chat_id=cfg.channel_id,
-            photo=draft["image_url"],
-            caption=draft["caption_html"],
-            parse_mode=ParseMode.HTML,
-        )
-        await db.upsert_publication(
-            draft["fingerprint"],
-            draft["canonical_name"],
-            sent.message_id,
-        )
-        await db.delete_draft(draft["id"])
-        await callback.message.edit_reply_markup(reply_markup=None)
-        await callback.answer("Отправлено в канал ✅")
+@dp.callback_query(F.data == "publish")
+async def cb_publish(callback: CallbackQuery) -> None:
+    if callback.from_user.id != settings.admin_id:
+        await callback.answer("Недоступно", show_alert=True)
         return
 
-    if callback.data == "regen":
-        await db.delete_draft(draft["id"])
+    payload = await load_draft(settings.database_path, callback.message.chat.id)
+    if not payload:
+        await callback.answer("Черновик не найден", show_alert=True)
+        return
+
+    caption = payload["caption"]
+
+    if payload.get("image_url"):
         try:
-            await callback.message.delete()
-        except Exception:
-            pass
-        await callback.answer("Генерирую новое превью…")
-        await generate_preview(callback.bot, callback.message.chat.id)
-        return
-
-    if callback.data == "edit":
-        await state.set_state(EditStates.waiting_text)
-        await state.update_data(
-            draft_id=draft["id"],
-            preview_chat_id=callback.message.chat.id,
-            preview_msg_id=callback.message.message_id,
+            await bot.send_photo(
+                chat_id=settings.channel_id,
+                photo=payload["image_url"],
+                caption=caption,
+            )
+        except Exception as exc:
+            logging.warning("Channel photo send failed: %s", exc)
+            await bot.send_message(
+                chat_id=settings.channel_id,
+                text=caption,
+                disable_web_page_preview=False,
+            )
+    else:
+        await bot.send_message(
+            chat_id=settings.channel_id,
+            text=caption,
+            disable_web_page_preview=False,
         )
-        await callback.answer()
-        await callback.message.reply(
-            "Пришли новый текст подписи. HTML можно оставить, ссылки тоже."
-        )
 
-
-@dp.message(EditStates.waiting_text)
-async def on_new_text(message: Message, state: FSMContext) -> None:
-    if not message.from_user or message.from_user.id != cfg.admin_user_id:
-        return
-
-    data = await state.get_data()
-    draft_id = int(data["draft_id"])
-    preview_chat_id = int(data["preview_chat_id"])
-    preview_msg_id = int(data["preview_msg_id"])
-
-    new_caption = (message.text or "").strip()
-    if not new_caption:
-        await message.answer("Пустой текст не подойдёт. Пришли нормальную подпись.")
-        return
-
-    await db.update_draft_caption(draft_id, new_caption)
-    try:
-        await message.bot.edit_message_caption(
-            chat_id=preview_chat_id,
-            message_id=preview_msg_id,
-            caption=new_caption,
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_preview(),
-        )
-        await message.answer("Готово. Превью обновила ✅")
-    except Exception:
-        await message.answer("Не смогла обновить превью. Проще сделать /post заново.")
-    finally:
-        await state.clear()
+    await mark_posted(settings.database_path, payload["url"])
+    await delete_draft(settings.database_path, callback.message.chat.id)
+    await callback.answer("Опубликовано")
+    await bot.send_message(callback.message.chat.id, "Готово. Пост ушёл в канал.")
 
 
 async def main() -> None:
-    await db.init()
-    bot = Bot(token=cfg.bot_token)
-    setup_scheduler(
-        bot=bot,
-        tz=cfg.tz,
-        hour=cfg.post_hour,
-        minute=cfg.post_minute,
-        job_coro=generate_preview,
-        job_args=[bot, cfg.admin_user_id],
-    )
+    await init_db(settings.database_path)
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 
