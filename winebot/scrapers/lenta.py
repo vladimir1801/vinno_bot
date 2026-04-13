@@ -15,7 +15,11 @@ UA = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
-    )
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
 }
 
 
@@ -62,8 +66,18 @@ class LentaScraper:
         url = "https://lenta.com/catalog/vino-22541/"
         try:
             response = await self.client.get(url)
-            response.raise_for_status()
-        except Exception:
+        except Exception as exc:
+            print(f"[lenta] request failed: {exc}")
+            return []
+
+        if response.status_code == 401:
+            print("[lenta] catalog returned 401 Unauthorized; source skipped for this run")
+            return []
+        if response.status_code == 403:
+            print("[lenta] catalog returned 403 Forbidden; source skipped for this run")
+            return []
+        if response.status_code >= 400:
+            print(f"[lenta] catalog bad status: {response.status_code}")
             return []
 
         doc = HTMLParser(response.text)
@@ -85,13 +99,18 @@ class LentaScraper:
             seen.add(item)
             unique_urls.append(item)
 
+        print(f"[lenta] extracted {len(unique_urls)} candidate urls")
         return unique_urls[:100]
 
     async def parse_offer(self, url: str) -> RawOffer | None:
         try:
             response = await self.client.get(url)
-            response.raise_for_status()
-        except Exception:
+        except Exception as exc:
+            print(f"[lenta] parse request failed for {url}: {exc}")
+            return None
+
+        if response.status_code >= 400:
+            print(f"[lenta] parse bad status {response.status_code} for {url}")
             return None
 
         title: str | None = None
@@ -145,6 +164,10 @@ class LentaScraper:
                 price = _int_price(match.group(1))
 
         raw_text = _clean_text(doc.text())
+        if not title:
+            print(f"[lenta] parsed page without title: {url}")
+            return None
+
         return RawOffer(
             store=self.store,
             url=url,

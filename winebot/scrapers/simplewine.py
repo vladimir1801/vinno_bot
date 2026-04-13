@@ -15,7 +15,9 @@ UA = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
-    )
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
 
@@ -33,6 +35,12 @@ def _extract_json_ld(html_text: str) -> Iterable[dict[str, Any] | list[Any]]:
             yield json.loads(raw)
         except Exception:
             continue
+
+
+def _extract_urls_from_text(text: str) -> list[str]:
+    found = re.findall(r'https://simplewine\.ru/catalog/[^"\'\s<>]+', text)
+    cleaned = [item.split("?")[0].rstrip("/ ") for item in found]
+    return cleaned
 
 
 def _int_price_from_any(value: Any) -> int | None:
@@ -63,7 +71,8 @@ class SimpleWineScraper:
         try:
             response = await self.client.get(url)
             response.raise_for_status()
-        except Exception:
+        except Exception as exc:
+            print(f"[simplewine] catalog request failed: {exc}")
             return []
 
         doc = HTMLParser(response.text)
@@ -71,11 +80,17 @@ class SimpleWineScraper:
 
         for node in doc.css("a[href]"):
             href = node.attributes.get("href", "")
-            if "/catalog/" not in href or "vino" not in href:
+            if "/catalog/" not in href:
+                continue
+            if "/vino/" not in href and "wine" not in href and "/product/" not in href:
                 continue
             if href.startswith("/"):
                 href = "https://simplewine.ru" + href
-            urls.append(href.split("?")[0])
+            if href.startswith("https://simplewine.ru/catalog/vino/") and href.count("/") > 5:
+                urls.append(href.split("?")[0])
+
+        if len(urls) < 10:
+            urls.extend(_extract_urls_from_text(response.text))
 
         seen: set[str] = set()
         unique_urls: list[str] = []
@@ -85,13 +100,15 @@ class SimpleWineScraper:
             seen.add(item)
             unique_urls.append(item)
 
+        print(f"[simplewine] extracted {len(unique_urls)} candidate urls")
         return unique_urls[:120]
 
     async def parse_offer(self, url: str) -> RawOffer | None:
         try:
             response = await self.client.get(url)
             response.raise_for_status()
-        except Exception:
+        except Exception as exc:
+            print(f"[simplewine] parse request failed for {url}: {exc}")
             return None
 
         doc = HTMLParser(response.text)
@@ -145,6 +162,10 @@ class SimpleWineScraper:
                 price = _int_price_from_any(match.group(1))
 
         raw_text = _clean_text(doc.text())
+        if not title:
+            print(f"[simplewine] parsed page without title: {url}")
+            return None
+
         return RawOffer(
             store=self.store,
             url=url,
