@@ -109,7 +109,6 @@ class SimpleWineProductParser:
         return None
 
     def _pick_field(self, soup: BeautifulSoup, labels: list[str]) -> str | None:
-        # Простая эвристика по тексту страницы
         text = soup.get_text("\n", strip=True)
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         lowered_labels = [label.lower() for label in labels]
@@ -127,7 +126,6 @@ class SimpleWineProductParser:
                     if value and len(value) < 120:
                         return value
 
-        # Попытка вытащить из ld+json
         for script in soup.select("script[type='application/ld+json']"):
             raw = script.string or script.get_text(strip=True)
             if not raw:
