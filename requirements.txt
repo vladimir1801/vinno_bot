@@ -6,3 +6,4 @@ python-dotenv>=1.0,<2
 apscheduler>=3.10,<4
 openai>=1.40,<2
 pydantic>=2.7,<3
+beautifulsoup4
