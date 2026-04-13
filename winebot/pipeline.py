@@ -12,32 +12,41 @@ async def find_and_prepare_draft(settings: Settings) -> dict | None:
     parser = SimpleWineProductParser()
 
     urls = await browser.get_candidate_urls(limit=settings.max_candidates)
-    print(f"[pipeline] collected {len(urls)} SimpleWine candidate urls")
+    print(f"[pipeline] собрано {len(urls)} кандидатов")
 
     if not urls:
         return None
 
     for index, url in enumerate(urls, start=1):
-        print(f"[pipeline] parsing candidate {index}/{len(urls)}: {url}")
+        print(f"[pipeline] парсинг {index}/{len(urls)}: {url}")
 
-        if await was_posted_recently(settings.database_path, url):
-            print(f"[pipeline] skipped recent url: {url}")
+        if await was_posted_recently(settings.database_path, url, days=settings.history_days):
+            print(f"[pipeline] пропущен (уже был): {url}")
             continue
 
         card = await parser.parse(url)
         if not card:
-            print(f"[pipeline] parse failed: {url}")
+            print(f"[pipeline] не удалось спарсить: {url}")
             continue
 
-        payload = _prepare_payload(card)
-        print(f"[pipeline] prepared draft: {payload['title']}")
+        caption = await _make_caption(card, settings)
+        payload = _prepare_payload(card, caption)
+        print(f"[pipeline] готово: {payload['title']}")
         return payload
 
-    print("[pipeline] no valid cards after filtering")
+    print("[pipeline] нет подходящих кандидатов")
     return None
 
 
-def _prepare_payload(card: ProductCard) -> dict:
+async def _make_caption(card: ProductCard, settings: Settings) -> str:
+    """Генерирует текст карточки: через GPT если ключ задан, иначе шаблон."""
+    if settings.openai_api_key:
+        from winebot.services.ai_writer import generate_wine_post
+        return await generate_wine_post(card, settings.openai_api_key, settings.openai_model)
+    return build_caption(card)
+
+
+def _prepare_payload(card: ProductCard, caption: str) -> dict:
     return {
         "title": card.title,
         "url": card.url,
@@ -47,6 +56,11 @@ def _prepare_payload(card: ProductCard) -> dict:
         "grape": card.grape,
         "region": card.region,
         "volume": card.volume,
+        "color": card.color,
+        "sweetness": card.sweetness,
+        "alcohol": card.alcohol,
+        "year": card.year,
+        "description": card.description,
         "store": card.store,
-        "caption": build_caption(card),
+        "caption": caption,
     }

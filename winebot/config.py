@@ -10,9 +10,14 @@ class Settings:
     admin_id: int
     channel_id: str
     debug: bool = False
-    max_candidates: int = 8
+    max_candidates: int = 10
     database_path: str = "winebot.db"
     tz: str = "Asia/Yekaterinburg"
+    post_time: str = "10:00"
+    auto_publish: bool = False
+    history_days: int = 90
+    openai_api_key: str = ""          # если задан — используем GPT для карточки
+    openai_model: str = "gpt-4o-mini" # модель по умолчанию
 
 
 def load_settings() -> Settings:
@@ -32,22 +37,23 @@ def load_settings() -> Settings:
     except ValueError as exc:
         raise RuntimeError("ADMIN_ID must be integer") from exc
 
-    max_candidates_raw = os.getenv("MAX_CANDIDATES", "8").strip()
-    try:
-        max_candidates = max(1, min(20, int(max_candidates_raw)))
-    except ValueError:
-        max_candidates = 8
-
-    database_path = os.getenv("DATABASE_PATH", "winebot.db").strip() or "winebot.db"
-    tz = os.getenv("TZ", "Asia/Yekaterinburg").strip() or "Asia/Yekaterinburg"
-    debug = os.getenv("DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+    def _int(key: str, default: int, lo: int = 1, hi: int = 9999) -> int:
+        try:
+            return max(lo, min(hi, int(os.getenv(key, str(default)).strip())))
+        except ValueError:
+            return default
 
     return Settings(
         bot_token=bot_token,
         admin_id=admin_id,
         channel_id=channel_id,
-        debug=debug,
-        max_candidates=max_candidates,
-        database_path=database_path,
-        tz=tz,
+        debug=os.getenv("DEBUG", "").strip().lower() in {"1", "true", "yes", "on"},
+        max_candidates=_int("MAX_CANDIDATES", 10, 1, 20),
+        database_path=os.getenv("DATABASE_PATH", "winebot.db").strip() or "winebot.db",
+        tz=os.getenv("TZ", "Asia/Yekaterinburg").strip() or "Asia/Yekaterinburg",
+        post_time=os.getenv("POST_TIME", "10:00").strip() or "10:00",
+        auto_publish=os.getenv("AUTO_PUBLISH", "").strip().lower() in {"1", "true", "yes", "on"},
+        history_days=_int("HISTORY_DAYS", 90, 7, 3650),
+        openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
+        openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini",
     )
