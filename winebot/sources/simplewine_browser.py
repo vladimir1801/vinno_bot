@@ -20,7 +20,6 @@ log = logging.getLogger(__name__)
 _BASE = "https://simplewine.ru"
 _ROBOTS_URL = "https://simplewine.ru/robots.txt"
 
-# Fallback sitemap candidates to try if robots.txt has no Sitemap: directive
 _SITEMAP_FALLBACKS = [
     "https://simplewine.ru/sitemap.xml",
     "https://simplewine.ru/sitemap_index.xml",
@@ -71,9 +70,7 @@ class SimpleWineBrowser:
             timeout=30,
             follow_redirects=True,
         ) as client:
-            # Step 1: find sitemap URL(s) from robots.txt
             sitemap_roots = await self._discover_sitemaps(client)
-
             product_urls: list[str] = []
 
             for sitemap_url in sitemap_roots:
@@ -84,7 +81,7 @@ class SimpleWineBrowser:
                     product_urls.extend(batch)
                     if batch:
                         log.info(
-                            "Got %d product URLs from sitemap tree rooted at %s",
+                            "Got %d product URLs from %s",
                             len(batch),
                             sitemap_url,
                         )
@@ -94,10 +91,7 @@ class SimpleWineBrowser:
             return product_urls
 
     async def _discover_sitemaps(self, client: httpx.AsyncClient) -> list[str]:
-        """Return list of sitemap root URLs: from robots.txt first, then fallbacks."""
         found: list[str] = []
-
-        # Try robots.txt
         try:
             r = await client.get(_ROBOTS_URL)
             if r.status_code == 200:
@@ -114,7 +108,6 @@ class SimpleWineBrowser:
         if found:
             return found
 
-        # Fallback: try known paths
         log.info("No sitemap in robots.txt, trying fallback paths")
         for url in _SITEMAP_FALLBACKS:
             try:
@@ -131,7 +124,6 @@ class SimpleWineBrowser:
     async def _fetch_sitemap_tree(
         self, client: httpx.AsyncClient, sitemap_url: str, pool_size: int
     ) -> list[str]:
-        """Fetch a sitemap URL; if it is a sitemapindex, recurse into children."""
         r = await client.get(sitemap_url)
         r.raise_for_status()
         xml_text = r.text
@@ -156,7 +148,7 @@ class SimpleWineBrowser:
                     log.warning("Child sitemap error %s: %s", child_url, exc)
             return product_urls
         else:
-            return self._parse_url_sitemap(xml_text)
+            return self._parse_url_sitemap(xml_text, sitemap_url)
 
     @staticmethod
     def _parse_sitemap_index(xml_text: str) -> list[str]:
@@ -182,20 +174,35 @@ class SimpleWineBrowser:
         return urls
 
     @staticmethod
-    def _parse_url_sitemap(xml_text: str) -> list[str]:
+    def _parse_url_sitemap(xml_text: str, source: str = "") -> list[str]:
         try:
             root = ET.fromstring(xml_text)
         except ET.ParseError:
             xml_text = re.sub(r"^<\?xml[^>]+\?>", "", xml_text.lstrip("\ufeff")).strip()
             root = ET.fromstring(xml_text)
 
-        urls: list[str] = []
+        all_locs: list[str] = []
         for el in root.iter():
             tag = el.tag.split("}")[-1] if "}" in el.tag else el.tag
             if tag == "loc" and el.text:
-                u = el.text.strip()
-                if SimpleWineBrowser._looks_like_product_url(u):
-                    urls.append(u)
+                all_locs.append(el.text.strip())
+
+        # Log first 10 URLs so we can see the actual format
+        if all_locs:
+            log.info(
+                "SAMPLE URLs from %s (total %d): %s",
+                source or "sitemap",
+                len(all_locs),
+                " | ".join(all_locs[:10]),
+            )
+
+        urls = [u for u in all_locs if SimpleWineBrowser._looks_like_product_url(u)]
+        log.info(
+            "Filtered %d/%d URLs as wine products from %s",
+            len(urls),
+            len(all_locs),
+            source or "sitemap",
+        )
         return urls
 
     @staticmethod
