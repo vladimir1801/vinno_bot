@@ -43,19 +43,18 @@ class SimpleWineBrowser:
                         timeout=60_000,
                     )
                 except PlaywrightTimeout:
-                    log.warning("Таймаут загрузки каталога, пробуем продолжить")
+                    log.warning("Timeout, trying to continue")
 
                 await page.wait_for_timeout(3000)
 
                 for scroll_i in range(10):
                     try:
                         hrefs: list[str] = await page.evaluate(
-                            """() => Array.from(document.querySelectorAll('a[href]'))
-                                .map(a => a.getAttribute('href'))
-                                .filter(Boolean)"""
+                            "() => Array.from(document.querySelectorAll('a[href]'))"
+                            ".map(a => a.getAttribute('href')).filter(Boolean)"
                         )
                     except Exception as exc:
-                        log.warning("evaluate провалился на scroll %d: %s", scroll_i, exc)
+                        log.warning("evaluate failed on scroll %d: %s", scroll_i, exc)
                         await page.wait_for_timeout(1500)
                         continue
 
@@ -66,12 +65,12 @@ class SimpleWineBrowser:
                             if len(urls) >= limit:
                                 return urls
 
-                    log.info("Скролл %d: найдено товаров %d", scroll_i + 1, len(urls))
+                    log.info("Scroll %d: found %d products", scroll_i + 1, len(urls))
                     await page.mouse.wheel(0, 2800)
                     await page.wait_for_timeout(1400)
 
             except Exception as exc:
-                log.error("Ошибка в SimpleWineBrowser: %s", exc)
+                log.error("SimpleWineBrowser error: %s", exc)
             finally:
                 await browser.close()
 
@@ -79,22 +78,21 @@ class SimpleWineBrowser:
 
     @staticmethod
     def _looks_like_product_url(url: str) -> bool:
-        """Только конкретные страницы товаров, не фильтры и не каталог."""
         if not url.startswith("https://simplewine.ru/catalog/vino/"):
             return False
-
         parsed = urlparse(url)
         path = parsed.path.rstrip("/")
-
-        # Исключаем фильтры, пагинацию, сортировку
         bad_segments = ("/filter/", "/sort/", "/page/", "/compare/", "/cart/")
         if any(seg in path for seg in bad_segments):
             return False
-
-        # Исключаем query-параметры (страницы пагинации)
         if parsed.query:
             return False
-
-        # Страница товара: ровно 3 сегмента → /catalog/vino/{slug}
         parts = [p for p in path.split("/") if p]
-        return len(parts) == 3
+        if len(parts) != 3:
+            return False
+        slug = parts[2]
+        # Short = subcategory: porto(5), kheres(6), shampanskoe(11)
+        # Long  = product:     chateau-margaux-2019(20)
+        if len(slug) < 16:
+            return False
+        return True
