@@ -1,80 +1,84 @@
 from __future__ import annotations
 
 import logging
-from urllib.parse import urljoin, urlparse
+import random
+from urllib.parse import urlparse
 
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+import httpx
+from bs4 import BeautifulSoup
 
 log = logging.getLogger(__name__)
+
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+# Разные страницы каталога для разнообразия
+_CATALOG_PAGES = [
+    "https://simplewine.ru/catalog/vino/",
+    "https://simplewine.ru/catalog/vino/?page=2",
+    "https://simplewine.ru/catalog/vino/?page=3",
+    "https://simplewine.ru/catalog/vino/filter/color-krasnoe/",
+    "https://simplewine.ru/catalog/vino/filter/color-beloe/",
+    "https://simplewine.ru/catalog/vino/filter/country-italiya/",
+    "https://simplewine.ru/catalog/vino/filter/country-frantsiya/",
+    "https://simplewine.ru/catalog/vino/filter/country-ispaniya/",
+    "https://simplewine.ru/catalog/vino/filter/country-argentina/",
+]
 
 
 class SimpleWineBrowser:
     store = "SimpleWine"
-    catalog_url = "https://simplewine.ru/catalog/vino/"
 
-    async def get_candidate_urls(self, limit: int = 8) -> list[str]:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
-            context = await browser.new_context(
-                viewport={"width": 1440, "height": 1600},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                locale="ru-RU",
-                extra_http_headers={"Accept-Language": "ru-RU,ru;q=0.9"},
-            )
-            page = await context.new_page()
+    async def get_candidate_urls(self, limit: int = 10) -> list[str]:
+        urls: list[str] = []
+        pages = _CATALOG_PAGES.copy()
+        random.shuffle(pages)
 
-            urls: list[str] = []
-            try:
+        async with httpx.AsyncClient(
+            headers=_HEADERS,
+            timeout=30,
+            follow_redirects=True,
+        ) as client:
+            for catalog_url in pages:
+                if len(urls) >= limit:
+                    break
                 try:
-                    await page.goto(
-                        self.catalog_url,
-                        wait_until="load",
-                        timeout=60_000,
-                    )
-                except PlaywrightTimeout:
-                    log.warning("Timeout, trying to continue")
-
-                await page.wait_for_timeout(3000)
-
-                for scroll_i in range(10):
-                    try:
-                        hrefs: list[str] = await page.evaluate(
-                            "() => Array.from(document.querySelectorAll('a[href]'))"
-                            ".map(a => a.getAttribute('href')).filter(Boolean)"
-                        )
-                    except Exception as exc:
-                        log.warning("evaluate failed on scroll %d: %s", scroll_i, exc)
-                        await page.wait_for_timeout(1500)
+                    resp = await client.get(catalog_url)
+                    if resp.status_code != 200:
+                        log.warning("HTTP %d for %s", resp.status_code, catalog_url)
                         continue
 
-                    for href in hrefs:
-                        full_url = urljoin("https://simplewine.ru", href)
-                        if self._looks_like_product_url(full_url) and full_url not in urls:
-                            urls.append(full_url)
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    found = 0
+                    for tag in soup.find_all("a", href=True):
+                        href = tag["href"]
+                        if not href.startswith("/"):
+                            continue
+                        full = "https://simplewine.ru" + href
+                        if self._looks_like_product_url(full) and full not in urls:
+                            urls.append(full)
+                            found += 1
                             if len(urls) >= limit:
-                                return urls
+                                break
 
-                    log.info("Scroll %d: found %d products", scroll_i + 1, len(urls))
-                    await page.mouse.wheel(0, 2800)
-                    await page.wait_for_timeout(1400)
+                    log.info("Page %s: found %d products", catalog_url, found)
 
-            except Exception as exc:
-                log.error("SimpleWineBrowser error: %s", exc)
-            finally:
-                await browser.close()
+                except Exception as exc:
+                    log.warning("Error fetching %s: %s", catalog_url, exc)
 
-            return urls
+        random.shuffle(urls)
+        log.info("Total candidates: %d", len(urls))
+        return urls[:limit]
 
     @staticmethod
     def _looks_like_product_url(url: str) -> bool:
@@ -91,8 +95,6 @@ class SimpleWineBrowser:
         if len(parts) != 3:
             return False
         slug = parts[2]
-        # Short = subcategory: porto(5), kheres(6), shampanskoe(11)
-        # Long  = product:     chateau-margaux-2019(20)
         if len(slug) < 16:
             return False
         return True
