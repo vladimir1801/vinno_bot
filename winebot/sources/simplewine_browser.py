@@ -1,9 +1,9 @@
 """
 URL collection for SimpleWine via XML sitemap.
 
-SimpleWine is a React SPA -- catalog HTML has no product links.
-The sitemap is generated server-side and contains all product URLs.
-We discover the sitemap URL from /robots.txt first, then try known fallbacks.
+SimpleWine product URLs follow the pattern:
+  https://simplewine.ru/catalog/product/<slug_with_id>/
+NOT /catalog/vino/ (that is for category/filter pages).
 """
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-_BASE = "https://simplewine.ru"
 _ROBOTS_URL = "https://simplewine.ru/robots.txt"
 
 _SITEMAP_FALLBACKS = [
@@ -43,6 +42,28 @@ _HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
 }
+
+# Non-wine product keywords in slug -- exclude these
+_EXCLUDE_SLUG_WORDS = (
+    "nabor", "gift", "konyak", "cognac", "koniak",
+    "viski", "whisky", "whiskey",
+    "vodka", "vodkа",
+    "_rom_", "_rom/",
+    "dzhin", "gin_",
+    "steklo", "bokal", "aksessuar",
+    "pivo", "beer",
+    "tequila", "tekila", "mezcal", "mescal",
+    "kalvados", "calvados",
+    "brandy", "grappa",
+    "sake",
+    "absint",
+    "bitter_", "_bitter",
+    "liker", "liqueur",
+    "vermut",
+    "aperitiv",
+    "pishcha", "food",
+    "kniga", "book",
+)
 
 
 class SimpleWineBrowser:
@@ -80,11 +101,7 @@ class SimpleWineBrowser:
                     batch = await self._fetch_sitemap_tree(client, sitemap_url, pool_size)
                     product_urls.extend(batch)
                     if batch:
-                        log.info(
-                            "Got %d product URLs from %s",
-                            len(batch),
-                            sitemap_url,
-                        )
+                        log.info("Got %d wine URLs from %s", len(batch), sitemap_url)
                 except Exception as exc:
                     log.warning("Error processing sitemap %s: %s", sitemap_url, exc)
 
@@ -112,7 +129,9 @@ class SimpleWineBrowser:
         for url in _SITEMAP_FALLBACKS:
             try:
                 r = await client.get(url)
-                if r.status_code == 200 and ("<sitemap" in r.text or "<url>" in r.text or "<urlset" in r.text):
+                if r.status_code == 200 and (
+                    "<sitemap" in r.text or "<url>" in r.text or "<urlset" in r.text
+                ):
                     log.info("Sitemap found at fallback: %s", url)
                     return [url]
             except Exception:
@@ -132,8 +151,9 @@ class SimpleWineBrowser:
             child_urls = self._parse_sitemap_index(xml_text)
             log.info("Sitemap index %s has %d children", sitemap_url, len(child_urls))
 
-            priority = [u for u in child_urls if _is_catalog_sitemap(u)]
-            others = [u for u in child_urls if not _is_catalog_sitemap(u)]
+            # Process product sitemaps first
+            priority = [u for u in child_urls if _is_product_sitemap(u)]
+            others = [u for u in child_urls if not _is_product_sitemap(u)]
 
             product_urls: list[str] = []
             for child_url in priority + others:
@@ -187,18 +207,9 @@ class SimpleWineBrowser:
             if tag == "loc" and el.text:
                 all_locs.append(el.text.strip())
 
-        # Log first 10 URLs so we can see the actual format
-        if all_locs:
-            log.info(
-                "SAMPLE URLs from %s (total %d): %s",
-                source or "sitemap",
-                len(all_locs),
-                " | ".join(all_locs[:10]),
-            )
-
-        urls = [u for u in all_locs if SimpleWineBrowser._looks_like_product_url(u)]
+        urls = [u for u in all_locs if SimpleWineBrowser._looks_like_wine_url(u)]
         log.info(
-            "Filtered %d/%d URLs as wine products from %s",
+            "Filtered %d/%d wine product URLs from %s",
             len(urls),
             len(all_locs),
             source or "sitemap",
@@ -206,25 +217,30 @@ class SimpleWineBrowser:
         return urls
 
     @staticmethod
-    def _looks_like_product_url(url: str) -> bool:
-        if not url.startswith("https://simplewine.ru/catalog/vino/"):
+    def _looks_like_wine_url(url: str) -> bool:
+        # Products are at /catalog/product/<slug>/
+        if not url.startswith("https://simplewine.ru/catalog/product/"):
             return False
         parsed = urlparse(url)
-        path = parsed.path.rstrip("/")
-        bad_segments = ("/filter/", "/sort/", "/page/", "/compare/", "/cart/")
-        if any(seg in path for seg in bad_segments):
-            return False
         if parsed.query:
             return False
+        path = parsed.path.rstrip("/")
         parts = [p for p in path.split("/") if p]
+        # Must be exactly: catalog / product / <slug>
         if len(parts) != 3:
             return False
         slug = parts[2]
-        if len(slug) < 16:
+        # Slug must be reasonably long (wine slugs include name + year + volume + id)
+        if len(slug) < 15:
             return False
+        # Exclude non-wine products by slug keywords
+        slug_lower = slug.lower()
+        for word in _EXCLUDE_SLUG_WORDS:
+            if word in slug_lower:
+                return False
         return True
 
 
-def _is_catalog_sitemap(url: str) -> bool:
+def _is_product_sitemap(url: str) -> bool:
     lower = url.lower()
-    return any(kw in lower for kw in ("catalog", "vino", "product", "goods", "tovar"))
+    return "product" in lower and "category" not in lower and "review" not in lower
