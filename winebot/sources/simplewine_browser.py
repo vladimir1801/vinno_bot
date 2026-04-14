@@ -3,6 +3,7 @@ URL collection for SimpleWine via XML sitemap.
 
 SimpleWine is a React SPA -- catalog HTML has no product links.
 The sitemap is generated server-side and contains all product URLs.
+We discover the sitemap URL from /robots.txt first, then try known fallbacks.
 """
 from __future__ import annotations
 
@@ -16,6 +17,22 @@ import httpx
 
 log = logging.getLogger(__name__)
 
+_BASE = "https://simplewine.ru"
+_ROBOTS_URL = "https://simplewine.ru/robots.txt"
+
+# Fallback sitemap candidates to try if robots.txt has no Sitemap: directive
+_SITEMAP_FALLBACKS = [
+    "https://simplewine.ru/sitemap.xml",
+    "https://simplewine.ru/sitemap_index.xml",
+    "https://simplewine.ru/sitemap-index.xml",
+    "https://simplewine.ru/sitemaps/sitemap.xml",
+    "https://simplewine.ru/sitemap/sitemap.xml",
+    "https://simplewine.ru/sitemap/catalog.xml",
+    "https://simplewine.ru/catalog/sitemap.xml",
+]
+
+_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -27,9 +44,6 @@ _HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
 }
-
-_SITEMAP_ROOT = "https://simplewine.ru/sitemap.xml"
-_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
 
 class SimpleWineBrowser:
@@ -57,37 +71,92 @@ class SimpleWineBrowser:
             timeout=30,
             follow_redirects=True,
         ) as client:
-            log.info("Fetching sitemap index: %s", _SITEMAP_ROOT)
-            resp = await client.get(_SITEMAP_ROOT)
-            resp.raise_for_status()
-            root_xml = resp.text
+            # Step 1: find sitemap URL(s) from robots.txt
+            sitemap_roots = await self._discover_sitemaps(client)
 
             product_urls: list[str] = []
 
-            if "<sitemapindex" in root_xml:
-                child_urls = self._parse_sitemap_index(root_xml)
-                log.info("Sitemap index has %d child sitemaps", len(child_urls))
-
-                priority = [u for u in child_urls if _is_catalog_sitemap(u)]
-                others = [u for u in child_urls if not _is_catalog_sitemap(u)]
-                ordered = priority + others
-
-                for sitemap_url in ordered:
-                    if len(product_urls) >= pool_size:
-                        break
-                    try:
-                        log.info("Fetching child sitemap: %s", sitemap_url)
-                        r = await client.get(sitemap_url)
-                        r.raise_for_status()
-                        batch = self._parse_url_sitemap(r.text)
-                        log.info("found %d wine URLs in %s", len(batch), sitemap_url)
-                        product_urls.extend(batch)
-                    except Exception as exc:
-                        log.warning("Child sitemap error %s: %s", sitemap_url, exc)
-            else:
-                product_urls = self._parse_url_sitemap(root_xml)
+            for sitemap_url in sitemap_roots:
+                if len(product_urls) >= pool_size:
+                    break
+                try:
+                    batch = await self._fetch_sitemap_tree(client, sitemap_url, pool_size)
+                    product_urls.extend(batch)
+                    if batch:
+                        log.info(
+                            "Got %d product URLs from sitemap tree rooted at %s",
+                            len(batch),
+                            sitemap_url,
+                        )
+                except Exception as exc:
+                    log.warning("Error processing sitemap %s: %s", sitemap_url, exc)
 
             return product_urls
+
+    async def _discover_sitemaps(self, client: httpx.AsyncClient) -> list[str]:
+        """Return list of sitemap root URLs: from robots.txt first, then fallbacks."""
+        found: list[str] = []
+
+        # Try robots.txt
+        try:
+            r = await client.get(_ROBOTS_URL)
+            if r.status_code == 200:
+                for line in r.text.splitlines():
+                    line = line.strip()
+                    if line.lower().startswith("sitemap:"):
+                        url = line.split(":", 1)[1].strip()
+                        if url.startswith("http"):
+                            log.info("robots.txt sitemap: %s", url)
+                            found.append(url)
+        except Exception as exc:
+            log.warning("Could not fetch robots.txt: %s", exc)
+
+        if found:
+            return found
+
+        # Fallback: try known paths
+        log.info("No sitemap in robots.txt, trying fallback paths")
+        for url in _SITEMAP_FALLBACKS:
+            try:
+                r = await client.get(url)
+                if r.status_code == 200 and ("<sitemap" in r.text or "<url>" in r.text or "<urlset" in r.text):
+                    log.info("Sitemap found at fallback: %s", url)
+                    return [url]
+            except Exception:
+                pass
+
+        log.error("No sitemap found in robots.txt or any fallback path")
+        return []
+
+    async def _fetch_sitemap_tree(
+        self, client: httpx.AsyncClient, sitemap_url: str, pool_size: int
+    ) -> list[str]:
+        """Fetch a sitemap URL; if it is a sitemapindex, recurse into children."""
+        r = await client.get(sitemap_url)
+        r.raise_for_status()
+        xml_text = r.text
+
+        if "<sitemapindex" in xml_text:
+            child_urls = self._parse_sitemap_index(xml_text)
+            log.info("Sitemap index %s has %d children", sitemap_url, len(child_urls))
+
+            priority = [u for u in child_urls if _is_catalog_sitemap(u)]
+            others = [u for u in child_urls if not _is_catalog_sitemap(u)]
+
+            product_urls: list[str] = []
+            for child_url in priority + others:
+                if len(product_urls) >= pool_size:
+                    break
+                try:
+                    batch = await self._fetch_sitemap_tree(client, child_url, pool_size)
+                    product_urls.extend(batch)
+                    if batch:
+                        log.info("found %d wine URLs in %s", len(batch), child_url)
+                except Exception as exc:
+                    log.warning("Child sitemap error %s: %s", child_url, exc)
+            return product_urls
+        else:
+            return self._parse_url_sitemap(xml_text)
 
     @staticmethod
     def _parse_sitemap_index(xml_text: str) -> list[str]:
