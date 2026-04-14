@@ -44,6 +44,22 @@ dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone=settings.tz)
 
 
+# --- Глобальный обработчик ошибок -------------------------------------------
+
+@dp.errors()
+async def global_error_handler(event, exception: Exception) -> bool:
+    log.exception("Необработанная ошибка: %s", exception)
+    try:
+        await bot.send_message(
+            settings.admin_id,
+            "\u274c <b>Ошибка бота:</b>\n"
+            f"<code>{type(exception).__name__}: {str(exception)[:300]}</code>",
+        )
+    except Exception:
+        pass
+    return True   # помечаем как обработанную, бот не падает
+
+
 # --- Клавиатуры ---------------------------------------------------------------
 
 def _preview_keyboard() -> InlineKeyboardMarkup:
@@ -306,6 +322,11 @@ async def main() -> None:
     log.info("Планировщик запущен: %s (%s)", post_time, settings.tz)
 
     await bot.delete_webhook(drop_pending_updates=True)
+    await bot.send_message(
+        settings.admin_id,
+        f"\u2705 Бот запущен. Автопост в <b>{post_time}</b> ({settings.tz})\n"
+        f"AI-редактор: {'включён' if settings.openai_api_key else 'выключен (нет OPENAI_API_KEY)'}",
+    )
     try:
         await dp.start_polling(bot)
     finally:
