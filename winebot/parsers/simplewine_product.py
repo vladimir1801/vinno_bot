@@ -1,13 +1,30 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urljoin
 
+import httpx
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
+
+log = logging.getLogger(__name__)
+
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
 
 
 @dataclass(slots=True)
@@ -57,9 +74,35 @@ class SimpleWineProductParser:
             description=self._pick_description(soup),
         )
 
-    # ─── Playwright fetch ─────────────────────────────────────────────────────
+    # ─── HTML fetch: httpx first, Playwright fallback ────────────────────────
 
     async def _fetch_html(self, url: str) -> str | None:
+        # 1. Fast httpx request — works for SSR/server-rendered pages (~50% of
+        #    modern Russian e-commerce).  Much faster and harder to block.
+        html = await self._fetch_with_httpx(url)
+        if html and _has_product_content(html):
+            log.debug("httpx fetch OK: %s", url)
+            return html
+
+        # 2. Playwright fallback — needed for React/Vue CSR pages.
+        #    Uses wait_for_selector("h1") instead of a fixed delay so we
+        #    block until the JavaScript has actually rendered the title.
+        log.debug("httpx miss, trying Playwright: %s", url)
+        return await self._fetch_with_playwright(url)
+
+    async def _fetch_with_httpx(self, url: str) -> str | None:
+        try:
+            async with httpx.AsyncClient(
+                headers=_HEADERS, timeout=15, follow_redirects=True
+            ) as client:
+                r = await client.get(url)
+                if r.status_code == 200:
+                    return r.text
+        except Exception as exc:
+            log.debug("httpx error for %s: %s", url, exc)
+        return None
+
+    async def _fetch_with_playwright(self, url: str) -> str | None:
         try:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(
@@ -71,19 +114,24 @@ class SimpleWineProductParser:
                     ],
                 )
                 page = await browser.new_page(
-                    viewport={"width": 1440, "height": 1400},
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    ),
+                    viewport={"width": 1440, "height": 900},
+                    user_agent=_HEADERS["User-Agent"],
                     locale="ru-RU",
                 )
                 try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-                    await page.wait_for_timeout(2000)
+                    await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+                    # Wait for the product title to be rendered by JavaScript.
+                    # Falls through (no exception) if the selector never appears.
+                    try:
+                        await page.wait_for_selector(
+                            "h1, [itemprop='name'], [class*='product-title'], [class*='item-title']",
+                            timeout=12_000,
+                        )
+                    except Exception:
+                        pass
                     return await page.content()
-                except Exception:
+                except Exception as exc:
+                    log.debug("Playwright goto failed for %s: %s", url, exc)
                     return None
                 finally:
                     await browser.close()
