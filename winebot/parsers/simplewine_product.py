@@ -27,6 +27,15 @@ _HEADERS = {
 }
 
 
+def _has_product_content(html: str) -> bool:
+    """Quick check: does the HTML contain a rendered product title?"""
+    return bool(
+        re.search(r"<h1[\s>]", html, re.IGNORECASE)
+        or 'property="og:title"' in html
+        or "property='og:title'" in html
+    )
+
+
 @dataclass(slots=True)
 class ProductCard:
     title: str

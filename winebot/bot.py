@@ -14,6 +14,7 @@ from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    ErrorEvent,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -82,7 +83,8 @@ _search_task: asyncio.Task | None = None
 # --- Глобальный обработчик ошибок -------------------------------------------
 
 @dp.errors()
-async def global_error_handler(event, exception: Exception) -> bool:
+async def global_error_handler(event: ErrorEvent) -> bool:
+    exception = event.exception
     log.exception("Необработанная ошибка: %s", exception)
     try:
         await bot.send_message(
