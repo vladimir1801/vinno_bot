@@ -81,9 +81,8 @@ class SimpleWineBrowser:
             return []
 
         random.shuffle(urls)
-        result = urls[:limit]
-        log.info("Total candidates: %d (returning %d)", len(urls), len(result))
-        return result
+        log.info("Total candidates: %d", len(urls))
+        return urls
 
     async def _collect_from_sitemap(self, pool_size: int) -> list[str]:
         async with httpx.AsyncClient(

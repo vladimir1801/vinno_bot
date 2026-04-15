@@ -41,7 +41,7 @@ async def was_posted_recently(db_path: str, url: str, days: int = 90) -> bool:
     async with aiosqlite.connect(db_path) as db:
         cursor = await db.execute(
             "SELECT 1 FROM recent_posts WHERE url = ? "
-            "AND created_at > datetime('now', ?)"
+            "AND created_at > datetime('now', ?) "
             "LIMIT 1",
             (url, f"-{days} days"),
         )

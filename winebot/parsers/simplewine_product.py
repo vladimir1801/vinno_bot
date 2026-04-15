@@ -60,32 +60,36 @@ class SimpleWineProductParser:
     # ─── Playwright fetch ─────────────────────────────────────────────────────
 
     async def _fetch_html(self, url: str) -> str | None:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
-            page = await browser.new_page(
-                viewport={"width": 1440, "height": 1400},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                locale="ru-RU",
-            )
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-                await page.wait_for_timeout(2000)
-                return await page.content()
-            except Exception:
-                return None
-            finally:
-                await browser.close()
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-blink-features=AutomationControlled",
+                    ],
+                )
+                page = await browser.new_page(
+                    viewport={"width": 1440, "height": 1400},
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    locale="ru-RU",
+                )
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                    await page.wait_for_timeout(2000)
+                    return await page.content()
+                except Exception:
+                    return None
+                finally:
+                    await browser.close()
+        except Exception as exc:
+            log.warning("Playwright launch failed for %s: %s", url, exc)
+            return None
 
     # ─── Title ────────────────────────────────────────────────────────────────
 
@@ -141,14 +145,14 @@ class SimpleWineProductParser:
             if m:
                 return m.group(0)
 
-        # 2. Из заголовка (2015–2025)
-        m = re.search(r"\b(20(?:1[0-9]|2[0-5]))\b", title)
+        # 2. Из заголовка
+        m = re.search(r"\b(20[1-9]\d)\b", title)
         if m:
             return m.group(1)
 
         # 3. Из остального текста страницы
         text = soup.get_text(" ", strip=True)
-        m = re.search(r"\b(20(?:1[0-9]|2[0-5]))\b", text)
+        m = re.search(r"\b(20[1-9]\d)\b", text)
         if m:
             return m.group(1)
 
