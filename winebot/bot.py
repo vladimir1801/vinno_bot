@@ -75,6 +75,9 @@ bot = Bot(
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone=settings.tz)
 
+# Currently running search task (set while /post or auto-search is in progress)
+_search_task: asyncio.Task | None = None
+
 
 # --- Глобальный обработчик ошибок -------------------------------------------
 
@@ -163,7 +166,16 @@ async def _prepare_photo(url: str):
 
 
 async def generate_preview(chat_id: int) -> None:
-    payload = await find_and_prepare_draft(settings)
+    global _search_task
+    _search_task = asyncio.current_task()
+    try:
+        payload = await find_and_prepare_draft(settings)
+    except asyncio.CancelledError:
+        await bot.send_message(chat_id, "Поиск отменён (/cancel).")
+        return
+    finally:
+        _search_task = None
+
     if not payload:
         await bot.send_message(
             chat_id,
@@ -294,6 +306,7 @@ async def cmd_help(message: Message) -> None:
     await message.answer(
         "📋 <b>Команды:</b>\n\n"
         "/post — найти вино и показать превью\n"
+        "/cancel — остановить текущий поиск вина\n"
         "/fact — опубликовать факт о вине прямо сейчас\n"
         "/schedule HH:MM — изменить время ежедневного поста\n"
         "/schedule_fact HH:MM — изменить время факта о вине\n"
@@ -385,6 +398,17 @@ async def cmd_fact(message: Message) -> None:
         return
     await message.answer("Публикую факт о вине в канал...")
     await scheduled_fact_post()
+
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: Message) -> None:
+    if message.from_user and message.from_user.id != settings.admin_id:
+        return
+    if _search_task and not _search_task.done():
+        _search_task.cancel()
+        await message.answer("Останавливаю поиск...")
+    else:
+        await message.answer("Сейчас ничего не выполняется.")
 
 
 @dp.message(Command("schedule_fact"))

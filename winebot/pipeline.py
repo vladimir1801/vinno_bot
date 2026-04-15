@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from winebot.config import Settings
@@ -31,6 +32,9 @@ async def find_and_prepare_draft(settings: Settings) -> dict | None:
         return None
 
     for index, url in enumerate(urls, start=1):
+        # Allow asyncio.CancelledError to propagate (triggered by /cancel command)
+        await asyncio.sleep(0)
+
         log.info("[pipeline] парсинг %d/%d: %s", index, len(urls), url)
 
         if await was_posted_recently(settings.database_path, url, days=settings.history_days):
