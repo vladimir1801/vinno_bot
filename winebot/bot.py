@@ -5,12 +5,19 @@ import logging
 import re
 from datetime import datetime
 
+import httpx
 import pytz
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -27,6 +34,31 @@ from winebot.db import (
     set_setting,
 )
 from winebot.pipeline import find_and_prepare_draft
+from winebot.services.fact_service import get_random_fact
+
+_DL_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://simplewine.ru/",
+}
+
+
+async def _download_image(url: str) -> bytes | None:
+    """Download image bytes server-side so Telegram doesn't need to reach the source."""
+    try:
+        async with httpx.AsyncClient(
+            headers=_DL_HEADERS, timeout=15, follow_redirects=True
+        ) as client:
+            r = await client.get(url)
+            ct = r.headers.get("content-type", "")
+            if r.status_code == 200 and ct.startswith("image/"):
+                return r.content
+    except Exception as exc:
+        log.debug("Image download failed for %s: %s", url, exc)
+    return None
 
 
 logging.basicConfig(
@@ -80,16 +112,18 @@ async def _send_preview(chat_id: int, payload: dict) -> None:
     caption = payload["caption"]
 
     if payload.get("image_url"):
-        try:
-            await bot.send_photo(
-                chat_id=chat_id,
-                photo=payload["image_url"],
-                caption=caption,
-                reply_markup=_preview_keyboard(),
-            )
-            return
-        except Exception as exc:
-            log.warning("Не удалось отправить фото превью: %s", exc)
+        photo = await _prepare_photo(payload["image_url"])
+        if photo is not None:
+            try:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=photo,
+                    caption=caption,
+                    reply_markup=_preview_keyboard(),
+                )
+                return
+            except Exception as exc:
+                log.warning("Не удалось отправить фото превью: %s", exc)
 
     await bot.send_message(
         chat_id=chat_id,
@@ -102,20 +136,30 @@ async def _send_preview(chat_id: int, payload: dict) -> None:
 async def _publish_to_channel(payload: dict) -> None:
     caption = payload["caption"]
     if payload.get("image_url"):
-        try:
-            await bot.send_photo(
-                chat_id=settings.channel_id,
-                photo=payload["image_url"],
-                caption=caption,
-            )
-            return
-        except Exception as exc:
-            log.warning("Не удалось отправить фото в канал: %s", exc)
+        photo = await _prepare_photo(payload["image_url"])
+        if photo is not None:
+            try:
+                await bot.send_photo(
+                    chat_id=settings.channel_id,
+                    photo=photo,
+                    caption=caption,
+                )
+                return
+            except Exception as exc:
+                log.warning("Не удалось отправить фото в канал: %s", exc)
     await bot.send_message(
         chat_id=settings.channel_id,
         text=caption,
         disable_web_page_preview=False,
     )
+
+
+async def _prepare_photo(url: str):
+    """Download image bytes and wrap as BufferedInputFile; fall back to URL string."""
+    data = await _download_image(url)
+    if data:
+        return BufferedInputFile(data, filename="wine.jpg")
+    return url  # Telegram will try to fetch directly as fallback
 
 
 async def generate_preview(chat_id: int) -> None:
@@ -181,6 +225,49 @@ def _reschedule(post_time: str) -> None:
     log.info("Планировщик: новое время %s (%s)", post_time, settings.tz)
 
 
+async def scheduled_fact_post() -> None:
+    """Post a daily wine/vineyard fact with a Wikimedia photo."""
+    log.info("Публикация факта о вине")
+    try:
+        fact = await get_random_fact()
+        text = f"🍇 <b>Факт о вине</b>\n\n{fact['text']}"
+
+        if fact.get("image_url"):
+            photo = await _prepare_photo(fact["image_url"])
+            try:
+                await bot.send_photo(
+                    chat_id=settings.channel_id,
+                    photo=photo,
+                    caption=text,
+                )
+                return
+            except Exception as exc:
+                log.warning("Не удалось отправить фото факта: %s", exc)
+
+        await bot.send_message(
+            settings.channel_id,
+            text,
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        log.exception("Ошибка публикации факта: %s", exc)
+        await bot.send_message(settings.admin_id, f"Ошибка публикации факта: {exc}")
+
+
+def _reschedule_fact(fact_time: str) -> None:
+    hour, minute = map(int, fact_time.split(":"))
+    if scheduler.get_job("daily_fact"):
+        scheduler.remove_job("daily_fact")
+    scheduler.add_job(
+        scheduled_fact_post,
+        trigger=CronTrigger(hour=hour, minute=minute, timezone=settings.tz),
+        id="daily_fact",
+        name="Факт о вине",
+        replace_existing=True,
+    )
+    log.info("Факт о вине: новое время %s (%s)", fact_time, settings.tz)
+
+
 # --- Команды бота -------------------------------------------------------------
 
 @dp.message(Command("start"))
@@ -202,13 +289,18 @@ async def cmd_help(message: Message) -> None:
         return
     job = scheduler.get_job("daily_post")
     next_run = job.next_run_time.strftime("%d.%m %H:%M") if job and job.next_run_time else "—"
+    fact_job = scheduler.get_job("daily_fact")
+    next_fact = fact_job.next_run_time.strftime("%d.%m %H:%M") if fact_job and fact_job.next_run_time else "—"
     await message.answer(
         "📋 <b>Команды:</b>\n\n"
         "/post — найти вино и показать превью\n"
+        "/fact — опубликовать факт о вине прямо сейчас\n"
         "/schedule HH:MM — изменить время ежедневного поста\n"
+        "/schedule_fact HH:MM — изменить время факта о вине\n"
         "/status — статистика и расписание\n"
         "/help — это сообщение\n\n"
-        "Следующий автопост: <b>{}</b>".format(next_run)
+        "Следующий автопост: <b>{}</b>\n"
+        "Следующий факт: <b>{}</b>".format(next_run, next_fact)
     )
 
 
@@ -262,7 +354,13 @@ async def cmd_status(message: Message) -> None:
     if job and job.next_run_time:
         next_run = job.next_run_time.strftime("%d.%m.%Y %H:%M")
 
+    fact_job = scheduler.get_job("daily_fact")
+    next_fact = "—"
+    if fact_job and fact_job.next_run_time:
+        next_fact = fact_job.next_run_time.strftime("%d.%m.%Y %H:%M")
+
     post_time = await get_setting(settings.database_path, "post_time") or settings.post_time
+    fact_time = await get_setting(settings.database_path, "fact_post_time") or settings.fact_post_time
     count = await get_post_count(settings.database_path)
     mode = "автопубликация" if settings.auto_publish else "одобрение администратора"
 
@@ -270,11 +368,46 @@ async def cmd_status(message: Message) -> None:
         "📊 <b>Статус Vinno Bot</b>\n\n"
         "Время поста: <b>{}</b> ({})\n"
         "Следующий запуск: <b>{}</b>\n"
+        "Факт о вине: <b>{}</b> · следующий: <b>{}</b>\n"
         "Режим: {}\n"
         "Опубликовано вин: <b>{}</b>\n"
         "Не повторять: <b>{} дней</b>".format(
-            post_time, settings.tz, next_run, mode, count, settings.history_days
+            post_time, settings.tz, next_run,
+            fact_time, next_fact,
+            mode, count, settings.history_days
         )
+    )
+
+
+@dp.message(Command("fact"))
+async def cmd_fact(message: Message) -> None:
+    if message.from_user and message.from_user.id != settings.admin_id:
+        return
+    await message.answer("Публикую факт о вине в канал...")
+    await scheduled_fact_post()
+
+
+@dp.message(Command("schedule_fact"))
+async def cmd_schedule_fact(message: Message) -> None:
+    if message.from_user and message.from_user.id != settings.admin_id:
+        return
+
+    text = (message.text or "").strip()
+    m = re.search(r"\b(\d{1,2}):(\d{2})\b", text)
+    if not m:
+        await message.answer("Укажи время в формате HH:MM\nПример: /schedule_fact 14:00")
+        return
+
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        await message.answer("Некорректное время. Используй формат HH:MM (00:00–23:59).")
+        return
+
+    fact_time = "{:02d}:{:02d}".format(hour, minute)
+    await set_setting(settings.database_path, "fact_post_time", fact_time)
+    _reschedule_fact(fact_time)
+    await message.answer(
+        "Время факта о вине установлено: <b>{}</b> ({})".format(fact_time, settings.tz)
     )
 
 
@@ -318,13 +451,19 @@ async def main() -> None:
     saved_time = await get_setting(settings.database_path, "post_time")
     post_time = saved_time or settings.post_time
     _reschedule(post_time)
+
+    saved_fact_time = await get_setting(settings.database_path, "fact_post_time")
+    fact_time = saved_fact_time or settings.fact_post_time
+    _reschedule_fact(fact_time)
+
     scheduler.start()
-    log.info("Планировщик запущен: %s (%s)", post_time, settings.tz)
+    log.info("Планировщик запущен: пост %s, факт %s (%s)", post_time, fact_time, settings.tz)
 
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.send_message(
         settings.admin_id,
-        f"\u2705 Бот запущен. Автопост в <b>{post_time}</b> ({settings.tz})\n"
+        f"✅ Бот запущен.\n"
+        f"Автопост в <b>{post_time}</b> · Факт о вине в <b>{fact_time}</b> ({settings.tz})\n"
         f"AI-редактор: {'включён' if settings.openai_api_key else 'выключен (нет OPENAI_API_KEY)'}",
     )
     try:

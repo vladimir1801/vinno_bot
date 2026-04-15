@@ -18,6 +18,7 @@ class Settings:
     history_days: int = 90
     openai_api_key: str = ""          # если задан — используем GPT для карточки
     openai_model: str = "gpt-4o-mini" # модель по умолчанию
+    fact_post_time: str = "14:00"     # время ежедневного факта о вине
 
 
 def load_settings() -> Settings:
@@ -56,4 +57,5 @@ def load_settings() -> Settings:
         history_days=_int("HISTORY_DAYS", 90, 7, 3650),
         openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
         openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini",
+        fact_post_time=os.getenv("FACT_POST_TIME", "14:00").strip() or "14:00",
     )

@@ -1,10 +1,23 @@
 from __future__ import annotations
 
+import logging
+
 from winebot.config import Settings
 from winebot.db import was_posted_recently
 from winebot.parsers.simplewine_product import ProductCard, SimpleWineProductParser
 from winebot.services.post_builder import build_caption
+from winebot.services.price_comparator import (
+    PriceResult,
+    compare_prices,
+    enrich_card,
+    format_price_comparison,
+)
 from winebot.sources.simplewine_browser import SimpleWineBrowser
+
+log = logging.getLogger(__name__)
+
+# Telegram send_photo caption limit
+_CAPTION_LIMIT = 1_024
 
 
 async def find_and_prepare_draft(settings: Settings) -> dict | None:
@@ -12,41 +25,68 @@ async def find_and_prepare_draft(settings: Settings) -> dict | None:
     parser = SimpleWineProductParser()
 
     urls = await browser.get_candidate_urls(limit=settings.max_candidates)
-    print(f"[pipeline] собрано {len(urls)} кандидатов")
+    log.info("[pipeline] собрано %d кандидатов", len(urls))
 
     if not urls:
         return None
 
     for index, url in enumerate(urls, start=1):
-        print(f"[pipeline] парсинг {index}/{len(urls)}: {url}")
+        log.info("[pipeline] парсинг %d/%d: %s", index, len(urls), url)
 
         if await was_posted_recently(settings.database_path, url, days=settings.history_days):
-            print(f"[pipeline] пропущен (уже был): {url}")
+            log.info("[pipeline] пропущен (уже был): %s", url)
             continue
 
         card = await parser.parse(url)
         if not card:
-            print(f"[pipeline] не удалось спарсить: {url}")
+            log.info("[pipeline] не удалось спарсить: %s", url)
             continue
 
-        caption = await _make_caption(card, settings)
-        payload = _prepare_payload(card, caption)
-        print(f"[pipeline] готово: {payload['title']}")
+        # Feature 4: fill missing fields from Winestyle
+        card = await enrich_card(card)
+
+        # Feature 3: price comparison
+        price_results = await compare_prices(card)
+
+        caption = await _make_caption(card, settings, price_results)
+        payload = _prepare_payload(card, caption, price_results)
+        log.info("[pipeline] готово: %s", payload["title"])
         return payload
 
-    print("[pipeline] нет подходящих кандидатов")
+    log.warning("[pipeline] нет подходящих кандидатов")
     return None
 
 
-async def _make_caption(card: ProductCard, settings: Settings) -> str:
-    """Генерирует текст карточки: через GPT если ключ задан, иначе шаблон."""
+async def _make_caption(
+    card: ProductCard,
+    settings: Settings,
+    price_results: list[PriceResult],
+) -> str:
+    """Build caption via GPT (if key set) or template, then append price comparison."""
     if settings.openai_api_key:
         from winebot.services.ai_writer import generate_wine_post
-        return await generate_wine_post(card, settings.openai_api_key, settings.openai_model)
-    return build_caption(card)
+        caption = await generate_wine_post(card, settings.openai_api_key, settings.openai_model)
+    else:
+        caption = build_caption(card)
+
+    # Append price comparison if we have results from more than one store
+    if len(price_results) > 1:
+        price_block = format_price_comparison(price_results)
+        if price_block:
+            separator = "\n\n"
+            max_main = _CAPTION_LIMIT - len(separator) - len(price_block)
+            if len(caption) > max_main:
+                caption = caption[: max_main - 1].rstrip() + "…"
+            caption += separator + price_block
+
+    return caption
 
 
-def _prepare_payload(card: ProductCard, caption: str) -> dict:
+def _prepare_payload(
+    card: ProductCard,
+    caption: str,
+    price_results: list[PriceResult],
+) -> dict:
     return {
         "title": card.title,
         "url": card.url,
@@ -63,4 +103,5 @@ def _prepare_payload(card: ProductCard, caption: str) -> dict:
         "description": card.description,
         "store": card.store,
         "caption": caption,
+        "price_results": [r.to_dict() for r in price_results],
     }

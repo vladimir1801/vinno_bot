@@ -129,3 +129,49 @@ def build_caption(card: ProductCard) -> str:
     parts.append(f'<a href="{card.url}">🔗 Смотреть на SimpleWine</a>')
 
     return "\n\n".join(parts)
+
+
+# ─── Price comparison (imported by pipeline) ──────────────────────────────────
+
+def format_price_comparison(results: list) -> str:
+    """
+    Builds a compact HTML price-comparison block.
+    Accepts list of PriceResult objects or plain dicts with keys
+    store / price / url.
+    """
+    import re as _re
+
+    if not results or len(results) < 2:
+        return ""
+
+    def _to_dict(r) -> dict:
+        if hasattr(r, "to_dict"):
+            return r.to_dict()
+        return dict(r)
+
+    dicts = [_to_dict(r) for r in results]
+
+    def price_num(d: dict) -> float:
+        p = d.get("price") or ""
+        m = _re.search(r"(\d[\d\s]*)", p.replace("\xa0", " "))
+        if m:
+            try:
+                return float(_re.sub(r"\s+", "", m.group(1)))
+            except ValueError:
+                pass
+        return float("inf")
+
+    cheapest = min(dicts, key=price_num)
+    lines = ["🛒 <b>Сравнение цен:</b>"]
+    for d in dicts:
+        store = d.get("store", "")
+        price = d.get("price") or "—"
+        url = d.get("url")
+        badge = "✅ " if d is cheapest and price_num(d) < float("inf") else "    "
+        entry = (
+            f"{badge}<a href='{url}'>{store}</a>: <b>{price}</b>"
+            if url
+            else f"{badge}{store}: <b>{price}</b>"
+        )
+        lines.append(entry)
+    return "\n".join(lines)
