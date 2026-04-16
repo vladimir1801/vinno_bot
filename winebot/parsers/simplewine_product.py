@@ -143,13 +143,18 @@ class SimpleWineProductParser:
                 )
                 try:
                     await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-                    # Wait for the product title to be rendered by JavaScript.
-                    # Falls through (no exception) if the selector never appears.
+                    # Wait for product title first.
                     try:
                         await page.wait_for_selector(
                             "h1, [itemprop='name'], [class*='product-title'], [class*='item-title']",
                             timeout=12_000,
                         )
+                    except Exception:
+                        pass
+                    # Then wait for dynamic content (characteristics load via API after title).
+                    # networkidle = no network requests for 500 ms — reliable for CSR shops.
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=10_000)
                     except Exception:
                         pass
                     return await page.content()
@@ -178,12 +183,113 @@ class SimpleWineProductParser:
     # ─── Image ────────────────────────────────────────────────────────────────
 
     def _pick_image(self, soup: BeautifulSoup, url: str) -> str | None:
+        # 1. og:image — explicit, usually the product photo in good resolution
         meta = soup.select_one("meta[property='og:image']")
         if meta and meta.get("content"):
-            return urljoin(url, meta["content"])
-        img = soup.find("img")
-        if img and img.get("src"):
-            return urljoin(url, img["src"])
+            img_url = meta["content"].strip()
+            if img_url:
+                return urljoin(url, img_url)
+
+        # 2. JSON-LD image field
+        for script in soup.select("script[type='application/ld+json']"):
+            raw = script.string or script.get_text(strip=True)
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+                found = self._search_json_image(data)
+                if found:
+                    return urljoin(url, found)
+            except Exception:
+                continue
+
+        # 3. Product image containers — prefer srcset largest, then src
+        for selector in [
+            "[itemprop='image']",
+            "[class*='product-image'] img",
+            "[class*='product-photo'] img",
+            "[class*='product-gallery'] img",
+            "[class*='gallery__main'] img",
+            "[class*='item-image'] img",
+        ]:
+            node = soup.select_one(selector)
+            if not node:
+                continue
+            best = self._best_src(node)
+            if best:
+                return urljoin(url, best)
+
+        # 4. __NEXT_DATA__ / embedded JSON for image URL
+        next_data = self._parse_next_data(soup)
+        if next_data:
+            found = self._search_json_image(next_data)
+            if found:
+                return urljoin(url, found)
+
+        # 5. Last resort: first <img> that looks like a real product photo
+        for img in soup.find_all("img", src=True):
+            src = img.get("src", "")
+            if src.startswith("data:") or not src:
+                continue
+            # Skip tiny icons and logos heuristically
+            w = img.get("width") or img.get("data-width") or "0"
+            try:
+                if int(str(w).rstrip("px")) < 100:
+                    continue
+            except ValueError:
+                pass
+            return urljoin(url, src)
+
+        return None
+
+    def _best_src(self, img_tag) -> str | None:
+        """Return the highest-resolution URL from srcset or fall back to src/data-src."""
+        for attr in ("srcset", "data-srcset"):
+            srcset = img_tag.get(attr, "")
+            if not srcset:
+                continue
+            best_url, best_w = None, 0
+            for entry in srcset.split(","):
+                parts = entry.strip().split()
+                if len(parts) >= 2:
+                    try:
+                        w = int(parts[1].rstrip("w"))
+                        if w > best_w:
+                            best_w, best_url = w, parts[0]
+                    except ValueError:
+                        pass
+                elif parts:
+                    best_url = best_url or parts[0]
+            if best_url:
+                return best_url
+        for attr in ("src", "data-src", "data-lazy-src"):
+            val = img_tag.get(attr, "")
+            if val and not val.startswith("data:"):
+                return val
+        return None
+
+    def _search_json_image(self, data: Any) -> str | None:
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if key.lower() in ("image", "imageurl", "image_url", "photo", "photourl"):
+                    if isinstance(value, str) and value.startswith("http"):
+                        return value
+                    if isinstance(value, list):
+                        for item in value:
+                            if isinstance(item, str) and item.startswith("http"):
+                                return item
+                            if isinstance(item, dict):
+                                u = item.get("url") or item.get("contentUrl")
+                                if u and isinstance(u, str):
+                                    return u
+                found = self._search_json_image(value)
+                if found:
+                    return found
+        elif isinstance(data, list):
+            for item in data:
+                found = self._search_json_image(item)
+                if found:
+                    return found
         return None
 
     # ─── Price ────────────────────────────────────────────────────────────────
@@ -323,7 +429,27 @@ class SimpleWineProductParser:
             if isinstance(value, str) and value.strip():
                 return value.strip()
 
+        # Next.js embeds full page props in __NEXT_DATA__ — try it last
+        next_data = self._parse_next_data(soup)
+        if next_data:
+            value = self._search_json(next_data, lowered_labels)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
         return None
+
+    def _parse_next_data(self, soup: BeautifulSoup) -> Any:
+        """Extract Next.js embedded JSON from <script id='__NEXT_DATA__'>."""
+        tag = soup.find("script", id="__NEXT_DATA__")
+        if not tag:
+            return None
+        raw = tag.string or tag.get_text(strip=True)
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
 
     def _search_json(self, data: Any, labels: list[str]) -> str | None:
         if isinstance(data, dict):
