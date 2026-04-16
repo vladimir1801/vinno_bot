@@ -19,6 +19,7 @@ class Settings:
     openai_api_key: str = ""          # если задан — используем GPT для карточки
     openai_model: str = "gpt-4o-mini" # модель по умолчанию
     fact_post_time: str = "14:00"     # время ежедневного факта о вине
+    max_price_rub: int = 5000         # 0 = без ограничения
 
 
 def load_settings() -> Settings:
@@ -58,4 +59,5 @@ def load_settings() -> Settings:
         openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
         openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini",
         fact_post_time=os.getenv("FACT_POST_TIME", "14:00").strip() or "14:00",
+        max_price_rub=_int("MAX_PRICE_RUB", 5000, 0, 999_999),
     )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 from winebot.config import Settings
 from winebot.db import was_posted_recently
@@ -19,6 +20,19 @@ log = logging.getLogger(__name__)
 
 # Telegram send_photo caption limit
 _CAPTION_LIMIT = 1_024
+
+
+def _price_ok(price: str | None, max_rub: int) -> bool:
+    """Return True if price is within the configured limit (0 = no limit)."""
+    if not max_rub or not price:
+        return True
+    m = re.search(r"(\d[\d\s\xa0]*)", price)
+    if m:
+        try:
+            return int(re.sub(r"[\s\xa0]+", "", m.group(1))) <= max_rub
+        except ValueError:
+            pass
+    return True
 
 
 async def find_and_prepare_draft(settings: Settings) -> dict | None:
@@ -48,6 +62,11 @@ async def find_and_prepare_draft(settings: Settings) -> dict | None:
 
         # Feature 4: fill missing fields from Winestyle
         card = await enrich_card(card)
+
+        # Price filter
+        if not _price_ok(card.price, settings.max_price_rub):
+            log.info("[pipeline] пропущен (цена выше лимита %d ₽): %s", settings.max_price_rub, url)
+            continue
 
         # Feature 3: price comparison
         price_results = await compare_prices(card)

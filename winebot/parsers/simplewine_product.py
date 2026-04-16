@@ -28,12 +28,26 @@ _HEADERS = {
 
 
 def _has_product_content(html: str) -> bool:
-    """Quick check: does the HTML contain a rendered product title?"""
-    return bool(
+    """True only when the page has BOTH a title AND rendered characteristic fields.
+
+    SimpleWine is a React CSR app.  The static HTML shell contains og:title and
+    sometimes country/region, but grape variety, alcohol, volume and year are
+    injected by JavaScript.  If those fields are absent we must fall back to
+    Playwright so we get the fully-rendered DOM.
+    """
+    has_title = bool(
         re.search(r"<h1[\s>]", html, re.IGNORECASE)
         or 'property="og:title"' in html
         or "property='og:title'" in html
     )
+    if not has_title:
+        return False
+    # These words appear only in the JS-rendered characteristics table.
+    # If none of them is present the page is an empty shell.
+    html_lower = html.lower()
+    return any(kw in html_lower for kw in (
+        "крепость", "объём", "объем", "алкоголь", "сорт винограда",
+    ))
 
 
 @dataclass(slots=True)
